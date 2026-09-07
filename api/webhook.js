@@ -4,77 +4,50 @@ const TelegramBot = require('node-telegram-bot-api');
 
 const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const token_kv = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
-
-// Initialize KV client explicitly
 const kv = url && token_kv ? createClient({ url, token: token_kv }) : null;
-
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new TelegramBot(token);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 async function getUser(id) {
-  if (!kv) throw new Error("Base de datos no configurada (faltan variables KV)");
+  if (!kv) throw new Error("Base de datos no configurada.");
   let user = await kv.get(`user:${id}`);
   if (!user) {
-    user = { status: 'EXPLORING', current_track: null };
+    user = { status: 'EXPLORING', current_track: null, chapter: 0 };
     await kv.set(`user:${id}`, user);
   }
   return user;
 }
 
-async function updateUserStatus(id, status, track) {
-  const user = await getUser(id);
-  user.status = status;
-  user.current_track = track;
+async function saveUser(id, user) {
   await kv.set(`user:${id}`, user);
 }
 
-async function addIdea(id, idea) {
-  let backlog = await kv.get(`backlog:${id}`) || [];
-  backlog.push(idea);
-  await kv.set(`backlog:${id}`, backlog);
-}
-
-async function getBacklog(id) {
-  return await kv.get(`backlog:${id}`) || [];
-}
-
-const sysPrompt = `Eres un Tutor Privado Experto de IA con una máquina de estados integrada (Guardián de Foco, Investigador, Planificador y Evaluador Socrático).
-Tu objetivo principal es el APRENDIZAJE ACELERADO (Ultra-Learning). Debes lograr que el estudiante aprenda 20x más rápido que el promedio y alcance la maestría velozmente, garantizando una retención total.
-
-TU MISIÓN Y TÉCNICAS DE ULTRA-LEARNING:
-1. PARETO (80/20) Y PRIMEROS PRINCIPIOS: Ve directo al grano. Enséñale primero el 20% de los conceptos fundamentales que dominan el 80% del tema. Desglosa los temas complejos hasta sus verdades fundamentales (First Principles).
-2. TÉCNICA DE FEYNMAN Y ANALOGÍAS: Explica los conceptos de forma brutalmente clara, profunda y visual. Usa analogías inusuales pero altamente precisas del mundo real.
-3. RECUERDO ACTIVO (ACTIVE RECALL): Jamás dejes que el estudiante sea pasivo. Tras cada bloque de enseñanza, haz SIEMPRE 1 o 2 preguntas de desafío (Socráticas) que lo obliguen a aplicar lo que acaba de leer. Si se equivoca, guíalo, no le des la respuesta de inmediato.
-4. GUARDIÁN DE FOCO: Si el estado es LOCKED_IN_TRACK, divide el tema en micro-hitos rápidos. Si el estudiante se desvía, bloquéalo amablemente y devuélvelo al track.
-
-REGLAS DE INTERACCIÓN:
-- Tono: Exigente, hiper-enfocado, brillante e inspirador. Eres un mentor de élite.
-- Velocidad: Maximiza la densidad de conocimiento. Cero paja. Todo debe conectar directamente con la maestría.`;
-
-async function generateResponse(status, track, userMessage) {
-  const prompt = `${sysPrompt}\n\nEstado del usuario: ${status}\nTema actual (Track): ${track || 'Ninguno'}\n\nEstudiante: ${userMessage}\nTutor:`;
-    const response = await ai.models.generateContent({
+async function generateSyllabus(topic) {
+  const prompt = `Eres un experto en Ultra-Learning. Crea un temario de maestría hiper-condensado de 4 hitos sobre "${topic}" usando Pareto (80/20) y Primeros Principios.
+Devuelve ÚNICAMENTE un array JSON válido. Cada elemento del array debe ser un string con TODA la teoría densa de ese hito, lista para enseñar, con analogías de Feynman. No uses bloques markdown alrededor del JSON.`;
+  
+  const response = await ai.models.generateContent({
     model: 'gemini-3.6-flash',
-    contents: prompt
+    contents: prompt,
   });
-  return response.text;
+  let text = response.text.trim();
+  if (text.startsWith('```json')) text = text.replace(/```json/g, '').replace(/```/g, '').trim();
+  if (text.startsWith('```')) text = text.replace(/```/g, '').trim();
+  return JSON.parse(text);
 }
+
+const sysPrompt = `Eres un Tutor Privado de Ultra-Learning. 
+TU MISIÓN ACTUAL:
+Estás enseñando un fragmento del temario. 
+1. Explica brevemente la duda del estudiante si la tiene.
+2. NUNCA avances al siguiente tema. El sistema te avisará cuándo avanzar.
+3. Evalúa con 1 sola pregunta de 'Active Recall' Socrática sobre el material actual para obligarlo a pensar.`;
 
 module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    // Debug route to check configuration
-    let debug = "Bot is running on Vercel!\n";
-    debug += `KV Configured: ${!!kv}\n`;
-    debug += `Telegram Token: ${!!token}\n`;
-    debug += `Gemini Key: ${!!process.env.GEMINI_API_KEY}\n`;
-    return res.status(200).send(debug);
-  }
-
+  if (req.method !== 'POST') return res.status(200).send('Bot Ultra-Learning Running!');
   const { message } = req.body;
-  if (!message || !message.text) {
-    return res.status(200).send('OK');
-  }
+  if (!message || !message.text) return res.status(200).send('OK');
 
   const chatId = message.chat.id.toString();
   const text = message.text;
@@ -82,74 +55,90 @@ module.exports = async (req, res) => {
   try {
     const user = await getUser(chatId);
 
-    if (text.startsWith('/estado')) {
-      let response = `📊 **ESTADO ACTUAL**\nStatus: \`${user.status}\`\n`;
-      if (user.current_track) response += `Track Activo: **${user.current_track}**\n`;
-      await bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+    if (text === '/estado') {
+      await bot.sendMessage(chatId, `📊 Estado: ${user.status}\nTrack: ${user.current_track || 'Ninguno'}\nHito Actual: ${user.chapter + 1}`);
       return res.status(200).send('OK');
     }
 
-    if (text.startsWith('/idea_backlog')) {
-      const idea = text.replace('/idea_backlog', '').trim();
-      if (!idea) {
-        await bot.sendMessage(chatId, "Dime qué idea quieres guardar. Ejemplo: `/idea_backlog Aprender Rust`", { parse_mode: 'Markdown' });
+    if (text === '/mis_apuntes') {
+      const syllabus = await kv.get(`syllabus:${chatId}`);
+      if (!syllabus) {
+        await bot.sendMessage(chatId, "No tienes apuntes activos. Inicia un tema con: quiero aprender [tema]");
         return res.status(200).send('OK');
       }
-      await addIdea(chatId, idea);
-      await bot.sendMessage(chatId, `✅ Idea guardada en tu Icebox/Backlog: "${idea}"`);
-      return res.status(200).send('OK');
-    }
-    
-    if (text.startsWith('/backlog')) {
-      const ideas = await getBacklog(chatId);
-      if (ideas.length === 0) {
-        await bot.sendMessage(chatId, "Tu backlog está vacío.");
-      } else {
-        let resp = "🧊 **TU ICEBOX (Backlog)**\n";
-        ideas.forEach((i, idx) => resp += `${idx+1}. ${i}\n`);
-        await bot.sendMessage(chatId, resp, { parse_mode: 'Markdown' });
-      }
+      let apuntes = `📚 **TUS APUNTES: ${user.current_track}**\n\n`;
+      syllabus.forEach((cap, i) => apuntes += `**Hito ${i+1}:**\n${cap}\n\n`);
+      // Telegram has a 4096 char limit, send chunked if needed
+      if (apuntes.length > 4000) apuntes = apuntes.substring(0, 4000) + "... (recortado)";
+      await bot.sendMessage(chatId, apuntes, { parse_mode: 'Markdown' });
       return res.status(200).send('OK');
     }
 
     const isChangingTopic = text.toLowerCase().includes("quiero aprender") || text.toLowerCase().includes("enséñame sobre");
-    
-    if (user.status === 'LOCKED_IN_TRACK' && isChangingTopic) {
-        if (!text.toLowerCase().includes(user.current_track.toLowerCase().split(' ')[0])) {
-            const lockWarning = `🔒 **GUARDIÁN DE FOCO ACTIVADO**\n\n` +
-              `Tienes activo el track de **${user.current_track}**. Para saltar a otro tema debes:\n` +
-              `(a) Pausar formalmente con justificación.\n` +
-              `(b) Completar el hito actual.\n\n` +
-              `Si solo es curiosidad, envíalo al backlog usando: /idea_backlog ${text.replace("quiero aprender", "").trim()} \n\n` +
-              `¿Seguimos con tu track actual?`;
-            await bot.sendMessage(chatId, lockWarning, { parse_mode: 'Markdown' });
+
+    if (user.status === 'EXPLORING' && isChangingTopic) {
+        const match = text.match(/aprender (.*)/i) || text.match(/sobre (.*)/i) || ["", "Tema nuevo"];
+        const topic = match[1];
+        await bot.sendMessage(chatId, `🧠 Generando Cuaderno de Estudio (Ultra-Learning) sobre: **${topic}**... Espera unos segundos.`, { parse_mode: 'Markdown' });
+        
+        try {
+            const syllabus = await generateSyllabus(topic);
+            await kv.set(`syllabus:${chatId}`, syllabus);
+            user.status = 'LOCKED_IN_TRACK';
+            user.current_track = topic;
+            user.chapter = 0;
+            await saveUser(chatId, user);
+            
+            const firstChapter = syllabus[0];
+            await bot.sendMessage(chatId, `✅ Cuaderno generado (4 Hitos).\n\n🔒 **FOCO BLOQUEADO: ${topic}**\n\n**Hito 1:**\n${firstChapter}\n\n*(Lee esto y dime qué entendiste o responde si te hice una pregunta)*`, { parse_mode: 'Markdown' });
+        } catch(err) {
+            await bot.sendMessage(chatId, `Error generando syllabus: ${err.message}`);
+        }
+        return res.status(200).send('OK');
+    }
+
+    if (user.status === 'LOCKED_IN_TRACK') {
+        if (text.toLowerCase() === '/siguiente') {
+            const syllabus = await kv.get(`syllabus:${chatId}`);
+            if (user.chapter + 1 >= syllabus.length) {
+                user.status = 'EXPLORING';
+                user.current_track = null;
+                await saveUser(chatId, user);
+                await bot.sendMessage(chatId, "🎉 ¡Felicidades! Has dominado este track. Tu estado vuelve a EXPLORING. ¿Qué quieres aprender ahora?");
+            } else {
+                user.chapter += 1;
+                await saveUser(chatId, user);
+                await bot.sendMessage(chatId, `➡️ **Hito ${user.chapter + 1}**:\n\n${syllabus[user.chapter]}\n\n*(Léelo y prepárate para la evaluación)*`, { parse_mode: 'Markdown' });
+            }
             return res.status(200).send('OK');
         }
-    }
 
-    if (user.status === 'EXPLORING' && (text.toLowerCase().includes('acepto el reto') || text.toLowerCase().includes('empecemos'))) {
-        const match = text.match(/reto de (.*)/i) || ["", "Nuevo Tema"];
-        await updateUserStatus(chatId, 'LOCKED_IN_TRACK', match[1] || 'Track Generico');
-        await bot.sendMessage(chatId, "🔒 **FOCO BLOQUEADO**. Tu estado ahora es `LOCKED_IN_TRACK`. ¡A trabajar! Escribe algo sobre el tema para evaluarte.", { parse_mode: 'Markdown' });
+        if (isChangingTopic && !text.toLowerCase().includes(user.current_track.toLowerCase().split(' ')[0])) {
+            await bot.sendMessage(chatId, `🛡️ **Guardián de Foco:** Estás bloqueado en **${user.current_track}**. Escribe '/siguiente' para avanzar al próximo hito, o '/abandonar' si realmente quieres salir.`);
+            return res.status(200).send('OK');
+        }
+
+        if (text.toLowerCase() === '/abandonar') {
+            user.status = 'EXPLORING';
+            await saveUser(chatId, user);
+            await bot.sendMessage(chatId, "Track abandonado. Estado: EXPLORING.");
+            return res.status(200).send('OK');
+        }
+
+        // Send current context to Gemini for chat
+        const syllabus = await kv.get(`syllabus:${chatId}`);
+        const currentTheory = syllabus[user.chapter];
+        const prompt = `${sysPrompt}\n\nTeoría Actual (Hito ${user.chapter + 1}):\n${currentTheory}\n\nEstudiante dice: ${text}\nTutor:`;
+        
+        await bot.sendChatAction(chatId, 'typing');
+        const response = await ai.models.generateContent({ model: 'gemini-3.6-flash', contents: prompt });
+        await bot.sendMessage(chatId, response.text, { parse_mode: 'Markdown' });
         return res.status(200).send('OK');
     }
-    
-    if (text.toLowerCase().includes('pausar track') || text.toLowerCase().includes('completado')) {
-        await updateUserStatus(chatId, 'EXPLORING', null);
-        await bot.sendMessage(chatId, "🔓 **TRACK LIBERADO**. Tu estado ahora es `EXPLORING`. ¿Qué nuevo reto quieres iniciar?", { parse_mode: 'Markdown' });
-        return res.status(200).send('OK');
-    }
 
-    await bot.sendChatAction(chatId, 'typing');
-    const aiResponse = await generateResponse(user.status, user.current_track, text);
-    await bot.sendMessage(chatId, aiResponse, { parse_mode: 'Markdown' });
-
+    await bot.sendMessage(chatId, "No entendí. Usa 'Quiero aprender [tema]' para iniciar un Track de Ultra-Learning.");
   } catch (error) {
-    console.error("Error processing message:", error);
-    try {
-      await bot.sendMessage(chatId, `⚠️ Error interno: ${error.message}`);
-    } catch(e) {}
+    try { await bot.sendMessage(chatId, `⚠️ Error: ${error.message}`); } catch(e) {}
   }
-
   res.status(200).send('OK');
 };
