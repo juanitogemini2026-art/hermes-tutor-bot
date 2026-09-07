@@ -53,9 +53,12 @@ REGLAS DE INTERACCIÓN:
 
 async function generateResponse(status, track, userMessage) {
   const prompt = `${sysPrompt}\n\nEstado del usuario: ${status}\nTema actual (Track): ${track || 'Ninguno'}\n\nEstudiante: ${userMessage}\nTutor:`;
-  const response = await ai.models.generateContent({
+    const response = await ai.models.generateContent({
     model: 'gemini-3.6-flash',
     contents: prompt,
+    config: {
+      tools: [{ googleSearch: {} }]
+    }
   });
   return response.text;
 }
