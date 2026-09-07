@@ -1,12 +1,19 @@
-const { kv } = require('@vercel/kv');
+const { createClient } = require('@vercel/kv');
 const { GoogleGenAI } = require('@google/genai');
 const TelegramBot = require('node-telegram-bot-api');
+
+const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const token_kv = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+
+// Initialize KV client explicitly
+const kv = url && token_kv ? createClient({ url, token: token_kv }) : null;
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new TelegramBot(token);
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 async function getUser(id) {
+  if (!kv) throw new Error("Base de datos no configurada (faltan variables KV)");
   let user = await kv.get(`user:${id}`);
   if (!user) {
     user = { status: 'EXPLORING', current_track: null };
@@ -49,7 +56,12 @@ async function generateResponse(status, track, userMessage) {
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
-    return res.status(200).send('Bot is running on Vercel!');
+    // Debug route to check configuration
+    let debug = "Bot is running on Vercel!\n";
+    debug += `KV Configured: ${!!kv}\n`;
+    debug += `Telegram Token: ${!!token}\n`;
+    debug += `Gemini Key: ${!!process.env.GEMINI_API_KEY}\n`;
+    return res.status(200).send(debug);
   }
 
   const { message } = req.body;
@@ -127,6 +139,9 @@ module.exports = async (req, res) => {
 
   } catch (error) {
     console.error("Error processing message:", error);
+    try {
+      await bot.sendMessage(chatId, `⚠️ Error interno: ${error.message}`);
+    } catch(e) {}
   }
 
   res.status(200).send('OK');
